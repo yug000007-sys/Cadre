@@ -147,10 +147,20 @@ def _parse_city_line(line, data):
 
 def _parse_line_items(text):
     # Items: line# \n\n item_id \n description (double newlines between number and id)
+    # Normalize: collapse 3+ newlines to 2, so pattern works with both fitz and pdfminer
+    text_norm = re.sub(r"\n{3,}", "\n\n", text)
+
     item_matches = list(re.finditer(
-        r"(?<!\d)(\d{1,3})\n\n([A-Z][A-Z0-9./_\-]{2,})\n(.*?)(?=\n\n?\d{1,3}\n\n?[A-Z][A-Z0-9./_\-]{2,}\n|\nOrdered\n|\nProduct\n|\nPage\n|\Z)",
-        text, re.DOTALL
+        r"(?<!\d)(\d{1,3})\n+([A-Z][A-Z0-9./_\-]{2,})\n(.*?)(?=\n+\d{1,3}\n+[A-Z][A-Z0-9./_\-]{2,}\n|\n+Ordered\n|\n+Product\n|\n+Page\n|\Z)",
+        text_norm, re.DOTALL
     ))
+    if not item_matches:
+        # Last resort: try on single-newline normalized text
+        text_single = re.sub(r"\n+", "\n", text)
+        item_matches = list(re.finditer(
+            r"(?<!\d)(\d{1,3})\n([A-Z][A-Z0-9./_\-]{2,})\n(.*?)(?=\n\d{1,3}\n[A-Z][A-Z0-9./_\-]{2,}\n|\nOrdered\n|\nProduct\n|\nPage\n|\Z)",
+            text_single, re.DOTALL
+        ))
 
     # Qty/price/extension triplets: "4 FT\n\n0.80000\n\nFT\n\n3.20"
     qty_matches = re.findall(
