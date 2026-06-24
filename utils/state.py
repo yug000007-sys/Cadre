@@ -1,17 +1,20 @@
-"""
-Shared state across Streamlit pages — agent status, processing log, config.
-"""
-
 import streamlit as st
 from datetime import datetime
+import os
 
 
 def init_state():
+    # Always try to load API key from secrets/env first
+    if not st.session_state.get("groq_api_key"):
+        try:
+            st.session_state["groq_api_key"] = st.secrets["groq"]["api_key"]
+        except Exception:
+            st.session_state["groq_api_key"] = os.environ.get("GROQ_API_KEY", "")
+
     defaults = {
         "agent_status":     "stopped",
         "agent_thread":     None,
-        "processing_log":   [],   # list of dicts: {time, quote, status, message}
-        "groq_api_key":     "",
+        "processing_log":   [],
         "groq_model":       "llama-3.3-70b-versatile",
         "outlook_email":    "",
         "outlook_password": "",
@@ -42,7 +45,6 @@ def log_event(quote_number: str, status: str, message: str):
         "status":  status,
         "message": message,
     })
-    # Keep last 200 log entries
     if len(st.session_state["processing_log"]) > 200:
         st.session_state["processing_log"] = st.session_state["processing_log"][-200:]
 
