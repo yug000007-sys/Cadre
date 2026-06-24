@@ -1,7 +1,7 @@
 """
 Cadre Wire Group — Quote Parser
-Uses fitz word-position extraction to handle the two-column PDF layout.
-Falls back to pdfminer line-based parsing if fitz unavailable.
+Uses fitz word-position extraction (coordinate-based, two-column layout).
+Pdfminer fallback for local use.
 """
 
 import re
@@ -15,7 +15,6 @@ try:
 except Exception:
     extract_msg = None
 
-# ─────────────────────────────────────────────────────────────────────────────
 SALESPERSON_MAP = {
     "regina deavers":   "rdeavers@cadrewire.com",
     "dara august":      "daugust@cadrewire.com",
@@ -71,43 +70,59 @@ def _parse_city_line(line, data):
         data["country"]  = "CANADA"
 
 
-# ── FITZ (pymupdf) parser — coordinate-based ──────────────────────────────────
+# ── Group fitz words into lines by Y coordinate ───────────────────────────────
+
+def _group_into_lines(words, x_min=0, x_max=9999, y_min=0, y_max=9999, tol=3):
+    """
+    words: list of (x0, y0, x1, y1, text, ...)
+    Returns list of (y, [text, text, ...]) sorted by y.
+    """
+    filtered = [w for w in words
+                if x_min <= w[0] < x_max and y_min <= w[1] < y_max]
+    if not filtered:
+        return []
+    filtered.sort(key=lambda w: (round(w[1] / tol), w[0]))
+    lines = []
+    cur_y_bucket, cur_texts = None, []
+    for w in filtered:
+        bucket = round(w[1] / tol)
+        if cur_y_bucket is None or bucket == cur_y_bucket:
+            cur_texts.append(w[4])
+            cur_y_bucket = bucket
+        else:
+            lines.append((cur_y_bucket * tol, cur_texts))
+            cur_texts, cur_y_bucket = [w[4]], bucket
+    if cur_texts:
+        lines.append((cur_y_bucket * tol, cur_texts))
+    return lines
+
+
+# ── FITZ parser ───────────────────────────────────────────────────────────────
 
 def _parse_with_fitz(pdf_bytes):
     import fitz
 
-    doc   = fitz.open(stream=pdf_bytes, filetype="pdf")
-    page0 = doc[0]
+    all_rows, all_pdfs_info = [], []
 
-    # ── words: (x0, y0, x1, y1, text, block, line, word) ────────────────────
-    words = page0.get_text("words")
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
-    def words_in_band(x_min, x_max, y_min=0, y_max=99999):
-        return [(w[4], w[1]) for w in words
-                if x_min <= w[0] <= x_max and y_min <= w[1] <= y_max]
+    # Collect all words across all pages
+    all_words = []
+    page_breaks = []
+    y_offset = 0
+    for page in doc:
+        pw = page.get_text("words")
+        for w in pw:
+            all_words.append((w[0], w[1] + y_offset, w[2], w[3] + y_offset, w[4]))
+        page_breaks.append(y_offset)
+        y_offset += page.rect.height + 20  # small gap between pages
 
-    def line_text(ws, y_tol=3):
-        """Group words into lines by Y coordinate."""
-        if not ws:
-            return []
-        ws = sorted(ws, key=lambda w: (round(w[1] / y_tol), w[0]))
-        lines, cur_y, cur = [], None, []
-        for txt, y in ws:
-            bucket = round(y / y_tol)
-            if cur_y is None or bucket == cur_y:
-                cur.append(txt)
-                cur_y = bucket
-            else:
-                lines.append(" ".join(cur))
-                cur, cur_y = [txt], bucket
-        if cur:
-            lines.append(" ".join(cur))
-        return lines
+    words = all_words
 
-    # Header block — right side of page (x > 350)
-    right_words = [(w[4], w[0], w[1]) for w in words if w[0] > 350]
-    right_words.sort(key=lambda w: (round(w[2] / 3), w[1]))
+    # Full text for regex searches
+    full_text = " ".join(w[4] for w in sorted(words, key=lambda w: (round(w[1]/3), w[0])))
 
+    # ── Header fields ─────────────────────────────────────────────────────────
     data = {
         "quote_number": "", "customer_number": "", "contact": "",
         "salesperson": "", "quote_date": "", "quote_valid": "",
@@ -115,193 +130,162 @@ def _parse_with_fitz(pdf_bytes):
         "zip_code": "", "country": "USA",
     }
 
-    # Full page words for regex searches
-    all_text = "\n".join(w[4] for w in sorted(words, key=lambda w: (round(w[1]/3), w[0])))
-    full_text = page0.get_text("text")
+    # Quote number — first 6-digit standalone number
+    for w in sorted(words, key=lambda w: w[1]):
+        if re.fullmatch(r"\d{6}", w[4]):
+            data["quote_number"] = w[4]
+            break
 
-    # Quote number
-    m = re.search(r"\b(\d{6})\b", full_text)
-    if m:
-        data["quote_number"] = m.group(1)
-
-    # Customer number — 5-7 digit number that appears near Quote number
-    nums = re.findall(r"\b(\d{5,7})\b", full_text)
-    seen_quote = False
-    for n in nums:
-        if n == data["quote_number"]:
-            seen_quote = True
+    # Customer number — 5-7 digit number near quote number
+    found_quote = False
+    for w in sorted(words, key=lambda w: w[1]):
+        if w[4] == data["quote_number"]:
+            found_quote = True
             continue
-        if seen_quote and n != data["quote_number"]:
-            data["customer_number"] = n
+        if found_quote and re.fullmatch(r"\d{5,7}", w[4]):
+            data["customer_number"] = w[4]
             break
 
     # Quote date
-    m2 = re.search(r"\b(\d{1,2}/\d{1,2}/\d{4})\b", full_text)
-    if m2:
-        data["quote_date"] = m2.group(1)
+    for w in sorted(words, key=lambda w: w[1]):
+        if re.fullmatch(r"\d{1,2}/\d{1,2}/\d{4}", w[4]):
+            data["quote_date"] = w[4]
+            break
 
-    # Quote valid through
-    m3 = re.search(r"Quote\s+Good\s+Through\s+(\d{1,2}/\d{1,2}/\d{4})", full_text)
-    if m3:
-        data["quote_valid"] = m3.group(1)
+    # Quote valid through — find "Through" word, then next date
+    through_y = None
+    for w in words:
+        if w[4] == "Through":
+            through_y = w[1]
+            break
+    if through_y is not None:
+        dates_after = [w[4] for w in words
+                       if re.fullmatch(r"\d{1,2}/\d{1,2}/\d{4}", w[4])
+                       and w[1] >= through_y - 2]
+        if dates_after:
+            data["quote_valid"] = dates_after[0]
 
-    # Contact — words on same Y line as "Contact" label, to its right but left of center
+    # Contact — words on same Y as "Contact" label, to its right, x < 500
     for w in words:
         if w[4].lower().rstrip(":") == "contact":
-            contact_y  = w[1]
-            contact_x1 = w[2]
+            cy, cx1 = w[1], w[2]
             nearby = [ww[4] for ww in words
-                      if abs(ww[1] - contact_y) < 4
-                      and ww[0] > contact_x1 + 2
-                      and ww[0] < 500
-                      and ww[4].lower() not in {"contact", "date", "salesperson", "customer", "quote"}]
-            data["contact"] = " ".join(nearby)
-            break
+                      if abs(ww[1] - cy) < 4 and ww[0] > cx1 + 2 and ww[0] < 500
+                      and ww[4].lower() not in {"contact","date","salesperson","customer","quote"}]
+            if nearby:
+                data["contact"] = " ".join(nearby)
+                break
 
     # Salesperson — same approach
     for w in words:
         if w[4].lower() == "salesperson":
-            sp_y  = w[1]
-            sp_x1 = w[2]
+            sy, sx1 = w[1], w[2]
             nearby = [ww[4] for ww in words
-                      if abs(ww[1] - sp_y) < 4
-                      and ww[0] > sp_x1 + 2
-                      and ww[0] < 500]
-            data["salesperson"] = " ".join(nearby)
-            break
-
-    # Company + address — left column below "Quoted For:"
-    for i, w in enumerate(words):
-        if "Quoted" in w[4] and i + 1 < len(words) and words[i+1][4] == "For:":
-            qf_y = w[1]
-            # Get lines just below Quoted For label, left side only (x < 300)
-            below = [(ww[4], ww[0], ww[1]) for ww in words
-                     if ww[1] > qf_y + 2 and ww[1] < qf_y + 80 and ww[0] < 310]
-            below.sort(key=lambda b: (round(b[2]/3), b[1]))
-
-            # Group into lines
-            block_lines = []
-            cur_y, cur = None, []
-            for txt, x, y in below:
-                bucket = round(y / 3)
-                if cur_y is None or bucket == cur_y:
-                    cur.append(txt)
-                    cur_y = bucket
-                else:
-                    block_lines.append(" ".join(cur))
-                    cur, cur_y = [txt], bucket
-            if cur:
-                block_lines.append(" ".join(cur))
-
-            if block_lines:
-                data["company"] = block_lines[0]
-            if len(block_lines) > 1:
-                data["address"] = block_lines[1]
-            if len(block_lines) > 2:
-                _parse_city_line(block_lines[2], data)
-            break
-
-    # ── Line items ────────────────────────────────────────────────────────────
-    # Find Y of "Line  Item" header row
-    line_header_y = None
-    for w in words:
-        if w[4] == "Line":
-            # Check if "Item" is nearby on same row
-            for w2 in words:
-                if w2[4] == "Item" and abs(w2[1] - w[1]) < 4 and w2[0] > w[0]:
-                    line_header_y = w[1]
-                    break
-            if line_header_y:
+                      if abs(ww[1] - sy) < 4 and ww[0] > sx1 + 2 and ww[0] < 500]
+            if nearby:
+                data["salesperson"] = " ".join(nearby)
                 break
 
-    # Find Y of "Product" (end of items)
-    product_y = 99999
+    # Company + address — left column below "Quoted For:"
+    qf_y = None
+    for i, w in enumerate(sorted(words, key=lambda w: w[1])):
+        if w[4] == "For:" or (w[4] == "For" and i > 0):
+            qf_y = w[1]
+            break
+        if "Quoted" in w[4]:
+            qf_y = w[1]
+            break
+
+    if qf_y is not None:
+        below_left = [(w[4], w[0], w[1]) for w in words
+                      if w[1] > qf_y + 2 and w[1] < qf_y + 90 and w[0] < 310]
+        below_left.sort(key=lambda b: (round(b[2]/3), b[1]))
+        block_lines = []
+        cur_y, cur = None, []
+        for txt, x, y in below_left:
+            bucket = round(y / 3)
+            if cur_y is None or bucket == cur_y:
+                cur.append(txt)
+                cur_y = bucket
+            else:
+                block_lines.append(" ".join(cur))
+                cur, cur_y = [txt], bucket
+        if cur:
+            block_lines.append(" ".join(cur))
+
+        if block_lines:     data["company"] = block_lines[0]
+        if len(block_lines) > 1: data["address"] = block_lines[1]
+        if len(block_lines) > 2: _parse_city_line(block_lines[2], data)
+
+    # ── Line items ────────────────────────────────────────────────────────────
+    # Find Y of "Line" + "Item" header (same Y row)
+    line_header_y = None
+    line_words_on_row = {}
     for w in words:
-        if w[4] == "Product" and w[1] > (line_header_y or 0):
-            product_y = w[1]
+        bucket = round(w[1] / 3)
+        line_words_on_row.setdefault(bucket, []).append(w[4])
+
+    for bucket, texts in sorted(line_words_on_row.items()):
+        if "Line" in texts and "Item" in texts and "Ordered" in texts:
+            line_header_y = bucket * 3
             break
 
     if line_header_y is None:
-        raise ValueError("Could not find line item table in PDF")
+        raise ValueError(f"Could not find item table header in quote {data['quote_number']}")
 
-    # Words in item area
-    item_words = [w for w in words
-                  if w[1] > line_header_y + 5 and w[1] < product_y]
+    # Find Y of "Product" footer
+    product_y = 999999
+    for w in words:
+        if w[4] == "Product" and w[1] > line_header_y + 10:
+            product_y = w[1]
+            break
 
-    # LEFT column: x < 350 → line numbers, item_ids, descriptions
-    # RIGHT column: x > 350 → qty, unit, price, unit, extension
+    # Separate left (x < 370) and right (x >= 370) columns in item area
+    item_area = [w for w in words if w[1] > line_header_y + 4 and w[1] < product_y]
+    left_words  = [w for w in item_area if w[0] < 370]
+    right_words = [w for w in item_area if w[0] >= 370]
 
-    left  = [(w[4], w[0], w[1]) for w in item_words if w[0] < 350]
-    right = [(w[4], w[0], w[1]) for w in item_words if w[0] >= 350]
+    # Group left words into lines
+    left_lines = _group_into_lines(left_words, x_min=0, x_max=370, tol=3)
 
-    left.sort(key=lambda w: (round(w[2]/3), w[1]))
-    right.sort(key=lambda w: (round(w[2]/3), w[1]))
-
-    # Group left into lines
-    def group_lines(ws, tol=3):
-        if not ws:
-            return []
-        ws = sorted(ws, key=lambda w: (round(w[2]/tol), w[1]))
-        lines, cur_y, cur = [], None, []
-        for txt, x, y in ws:
-            bucket = round(y / tol)
-            if cur_y is None or bucket == cur_y:
-                cur.append((txt, x))
-                cur_y = bucket
-            else:
-                lines.append((cur, cur_y * tol))
-                cur, cur_y = [(txt, x)], bucket
-        if cur:
-            lines.append((cur, cur_y * tol))
-        return lines
-
-    left_lines  = group_lines(left)
-    right_lines = group_lines(right)
-
-    # Parse item blocks from left column
-    # A new item starts with a line containing only a number
+    # Each item line: "1 HS.1635F1-C48"  (line_num + item_id on SAME Y row)
+    # Description lines follow on subsequent rows (indented, x > 30)
     items = []
     current = None
-    for words_in_line, y in left_lines:
-        line_text_str = " ".join(t for t, x in words_in_line)
-        is_line_num = bool(re.fullmatch(r"\d{1,3}", line_text_str.strip()))
-        looks_like_item_id = bool(re.match(r"[A-Z][A-Z0-9./_\-]{2,}", words_in_line[0][0])) if words_in_line else False
 
-        if is_line_num:
+    for y, texts in left_lines:
+        line_str = " ".join(texts)
+
+        # Check if line starts with a number followed by an item_id
+        m = re.match(r"^(\d{1,3})\s+([A-Z][A-Z0-9./_\-]{2,})(.*)?$", line_str)
+        if m:
             if current:
                 items.append(current)
-            current = {"line_num": int(line_text_str.strip()), "item_id": "", "desc_lines": [], "y": y}
+            item_id   = m.group(2)
+            extra     = _clean(m.group(3)) if m.group(3) else ""
+            current   = {"item_id": item_id, "desc_lines": [extra] if extra else [], "y_start": y}
         elif current is not None:
-            if not current["item_id"] and looks_like_item_id:
-                current["item_id"] = line_text_str.strip()
-            else:
-                current["desc_lines"].append(line_text_str)
+            # Description continuation line
+            desc_line = _clean(line_str)
+            if desc_line:
+                current["desc_lines"].append(desc_line)
 
     if current:
         items.append(current)
 
-    # Parse price/qty/extension from right column
-    # Pattern per item row: QTY UNIT  PRICE UNIT  EXTENSION
-    # Right column words grouped by Y proximity to each item
-    def find_right_for_item(item_y, next_y):
-        row_words = [(t, x, y) for t, x, y in right if item_y - 2 <= y <= next_y - 2]
-        row_words.sort(key=lambda w: w[1])  # left to right
-        return [t for t, x, y in row_words]
-
+    # Match each item to its right-column price/extension
     rows = []
     for i, item in enumerate(items):
-        next_y = items[i+1]["y"] if i + 1 < len(items) else product_y
-        right_row = find_right_for_item(item["y"], next_y)
+        next_y = items[i + 1]["y_start"] if i + 1 < len(items) else product_y
 
-        # Extract price and extension from right_row
-        # Pattern: QTY UNIT PRICE UNIT EXTENSION
-        price, ext = 0.0, 0.0
-        nums_found = re.findall(r"[\d,]+\.\d+", " ".join(right_row))
-        if len(nums_found) >= 2:
-            price = float(nums_found[0].replace(",", ""))
-            ext   = float(nums_found[-1].replace(",", ""))
-        elif len(nums_found) == 1:
-            price = ext = float(nums_found[0].replace(",", ""))
+        # Right column words for this item's Y range
+        right_for_item = [w for w in right_words
+                          if item["y_start"] - 2 <= w[1] < next_y - 2]
+        right_for_item.sort(key=lambda w: w[0])
+
+        nums = re.findall(r"[\d,]+\.\d+", " ".join(w[4] for w in right_for_item))
+        price = float(nums[0].replace(",", ""))  if nums else 0.0
+        ext   = float(nums[-1].replace(",", "")) if nums else 0.0
 
         desc = _clean(" ".join(item["desc_lines"]))
         rows.append({
@@ -311,17 +295,17 @@ def _parse_with_fitz(pdf_bytes):
             "TotalSales": ext,
         })
 
-    # Tax
+    # Tax row
     tax_amount = 0.0
-    for i, w in enumerate(words):
+    for w in words:
         if w[4] == "Tax" and w[1] > line_header_y:
-            # Find number to the right on same line
             tax_nums = [ww[4] for ww in words
                         if abs(ww[1] - w[1]) < 4 and ww[0] > w[0]]
             for tn in tax_nums:
-                m_t = re.match(r"[\d,]+\.\d{2}", tn)
-                if m_t:
-                    tax_amount = float(m_t.group().replace(",", ""))
+                if re.match(r"[\d,]+\.\d{2}$", tn):
+                    val = float(tn.replace(",", ""))
+                    if val > 0:
+                        tax_amount = val
                     break
             break
 
@@ -334,7 +318,7 @@ def _parse_with_fitz(pdf_bytes):
     return data, rows
 
 
-# ── PDFMINER fallback parser ──────────────────────────────────────────────────
+# ── PDFMINER fallback ─────────────────────────────────────────────────────────
 
 def _parse_with_pdfminer(pdf_bytes):
     from pdfminer.high_level import extract_text_to_fp
@@ -355,14 +339,11 @@ def _parse_with_pdfminer(pdf_bytes):
 
     for line in lines[:25]:
         if re.fullmatch(r"\d{6}", line):
-            data["quote_number"] = line
-            break
+            data["quote_number"] = line; break
     found = False
     for line in lines[:25]:
-        if line == data["quote_number"]:
-            found = True; continue
-        if found and re.fullmatch(r"\d{5,7}", line):
-            data["customer_number"] = line; break
+        if line == data["quote_number"]: found = True; continue
+        if found and re.fullmatch(r"\d{5,7}", line): data["customer_number"] = line; break
     for i, line in enumerate(lines[:25]):
         if line == data["customer_number"] and data["customer_number"]:
             if i+1 < len(lines): data["contact"]     = lines[i+1]
@@ -372,17 +353,14 @@ def _parse_with_pdfminer(pdf_bytes):
         if re.fullmatch(r"\d{1,2}/\d{1,2}/\d{4}", line):
             data["quote_date"] = line; break
     m = re.search(r"Quote Good Through\s*\n+\s*(\d{1,2}/\d{1,2}/\d{4})", text)
-    if not m:
-        m = re.search(r"Quote Good Through\s+(\d{1,2}/\d{1,2}/\d{4})", text)
-    if m:
-        data["quote_valid"] = m.group(1)
+    if not m: m = re.search(r"Quote Good Through\s+(\d{1,2}/\d{1,2}/\d{4})", text)
+    if m: data["quote_valid"] = m.group(1)
     m2 = re.search(r"Quoted For:\n+(.+?)\n+(.+?)\n+(.+?)(?:\n|$)", text)
     if m2:
         data["company"] = _clean(m2.group(1))
         data["address"] = _clean(m2.group(2))
         _parse_city_line(_clean(m2.group(3)), data)
 
-    # Normalize newlines for item pattern
     text_norm = re.sub(r"\n{3,}", "\n\n", text)
     item_matches = list(re.finditer(
         r"(?<!\d)(\d{1,3})\n+([A-Z][A-Z0-9./_\-]{2,})\n(.*?)(?=\n+\d{1,3}\n+[A-Z][A-Z0-9./_\-]{2,}\n|\n+Ordered\n|\n+Product\n|\n+Page\n|\Z)",
@@ -420,7 +398,14 @@ def _parse_with_pdfminer(pdf_bytes):
 def _parse_quote_pdf(pdf_bytes):
     try:
         import fitz  # noqa
-        data, line_items = _parse_with_fitz(pdf_bytes)
+        try:
+            data, line_items = _parse_with_fitz(pdf_bytes)
+        except Exception:
+            # fitz parsing failed — try pdfminer if available
+            try:
+                data, line_items = _parse_with_pdfminer(pdf_bytes)
+            except ImportError:
+                raise
     except ImportError:
         data, line_items = _parse_with_pdfminer(pdf_bytes)
 
