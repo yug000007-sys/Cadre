@@ -21,7 +21,8 @@ def render():
     output_path = st.session_state.get("output_xlsx", XLSX_PATH)
 
     if not api_key:
-        st.warning("⚠️ Groq API key not set. Go to **⚙️ Settings** to add it.")
+        st.warning("⚠️ Groq API key not set. Go to the **⚙️ Settings** tab above to add your Groq API key.")
+        st.info("👆 Click the **⚙️ Settings** tab at the top of the page.")
         return
 
     # ── File uploader — no type filter so .msg files are accepted ────────────

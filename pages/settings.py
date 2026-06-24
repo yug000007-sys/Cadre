@@ -1,13 +1,11 @@
 """
 Settings page — configure Groq API, Outlook credentials, output path.
+Auto-loads from st.secrets or environment variables on first run.
 """
 
 import streamlit as st
 import os
-
 from utils.state import init_state
-from utils.excel_io import XLSX_PATH
-
 
 GROQ_MODELS = [
     "llama-3.3-70b-versatile",
@@ -16,68 +14,106 @@ GROQ_MODELS = [
     "mixtral-8x7b-32768",
 ]
 
+def _load_defaults():
+    """Pull from st.secrets or env vars once, into session state."""
+    init_state()
+
+    def _get(session_key, *fallbacks):
+        if st.session_state.get(session_key):
+            return  # already set
+        for fb in fallbacks:
+            val = fb() if callable(fb) else fb
+            if val:
+                st.session_state[session_key] = val
+                return
+
+    _get("groq_api_key",
+         lambda: st.secrets.get("groq", {}).get("api_key", ""),
+         lambda: os.environ.get("GROQ_API_KEY", ""))
+
+    _get("groq_model",
+         lambda: st.secrets.get("groq", {}).get("model", ""),
+         "llama-3.3-70b-versatile")
+
+    _get("outlook_email",
+         lambda: st.secrets.get("outlook", {}).get("email", ""),
+         lambda: os.environ.get("CADRE_EMAIL", ""))
+
+    _get("outlook_password",
+         lambda: st.secrets.get("outlook", {}).get("password", ""),
+         lambda: os.environ.get("CADRE_PASSWORD", ""))
+
+    _get("output_xlsx",
+         lambda: st.secrets.get("output", {}).get("xlsx_path", ""),
+         "data/cadre_quotes.xlsx")
+
+    if not st.session_state.get("poll_interval"):
+        try:
+            st.session_state["poll_interval"] = int(
+                st.secrets.get("output", {}).get("poll_interval", 60)
+            )
+        except Exception:
+            st.session_state["poll_interval"] = 60
+
 
 def render():
-    init_state()
+    _load_defaults()
     st.title("⚙️ Settings")
-    st.caption("Configure API keys, Outlook connection, and output options.")
+    st.caption("Configure API keys, Outlook connection, and output options. Settings are saved for this session.")
 
-    # ── Load from env if not already in session ───────────────────────────────
-    if not st.session_state.get("groq_api_key"):
-        st.session_state["groq_api_key"] = os.environ.get("GROQ_API_KEY", "")
-    if not st.session_state.get("outlook_email"):
-        st.session_state["outlook_email"] = os.environ.get("CADRE_EMAIL", "")
-    if not st.session_state.get("outlook_password"):
-        st.session_state["outlook_password"] = os.environ.get("CADRE_PASSWORD", "")
-
-    # ── Groq API settings ─────────────────────────────────────────────────────
+    # ── Groq API ──────────────────────────────────────────────────────────────
     st.subheader("🤖 Groq API")
-    st.markdown("Get your free API key at [console.groq.com](https://console.groq.com)")
+    st.markdown(
+        "Get your **free** API key at [console.groq.com](https://console.groq.com) — "
+        "takes 2 minutes, generous free tier."
+    )
 
     api_key = st.text_input(
-        "Groq API key",
+        "Groq API key *",
         value=st.session_state.get("groq_api_key", ""),
         type="password",
         placeholder="gsk_...",
+        help="Required for AI extraction",
     )
     model = st.selectbox(
         "Model",
         options=GROQ_MODELS,
-        index=GROQ_MODELS.index(st.session_state.get("groq_model", GROQ_MODELS[0])),
-        help="llama-3.3-70b-versatile recommended for best extraction accuracy",
+        index=GROQ_MODELS.index(st.session_state.get("groq_model", GROQ_MODELS[0]))
+              if st.session_state.get("groq_model") in GROQ_MODELS else 0,
+        help="llama-3.3-70b-versatile is recommended",
     )
 
-    if st.button("Test Groq connection"):
+    if st.button("🔌 Test Groq connection", key="test_groq"):
         if not api_key:
             st.error("Enter an API key first.")
         else:
-            try:
-                from groq import Groq
-                client = Groq(api_key=api_key)
-                resp = client.chat.completions.create(
-                    model=model,
-                    messages=[{"role": "user", "content": "Reply with the single word: connected"}],
-                    max_tokens=10,
-                )
-                answer = resp.choices[0].message.content.strip().lower()
-                if "connected" in answer:
-                    st.success(f"✅ Connected to Groq ({model})")
-                else:
-                    st.success(f"✅ Groq responded: {answer}")
-            except Exception as e:
-                st.error(f"❌ Connection failed: {e}")
+            with st.spinner("Testing…"):
+                try:
+                    from groq import Groq
+                    client = Groq(api_key=api_key)
+                    resp = client.chat.completions.create(
+                        model=model,
+                        messages=[{"role": "user", "content": "Reply with only the word: connected"}],
+                        max_tokens=10,
+                        temperature=0,
+                    )
+                    answer = resp.choices[0].message.content.strip().lower()
+                    st.success(f"✅ Groq connected ({model}) — response: {answer}")
+                except Exception as e:
+                    st.error(f"❌ Failed: {e}")
 
     st.markdown("---")
 
-    # ── Outlook settings ──────────────────────────────────────────────────────
+    # ── Outlook ───────────────────────────────────────────────────────────────
     st.subheader("📬 Outlook / Exchange")
     st.markdown(
-        "For Microsoft 365 with MFA, use an **App Password** instead of your regular password. "
-        "[How to create an App Password](https://support.microsoft.com/en-us/account-billing/manage-app-passwords-for-two-step-verification-d6dc8c6d-4bf7-4851-ad95-6d07799387e9)"
+        "For **Microsoft 365 with MFA**, use an "
+        "[App Password](https://support.microsoft.com/en-us/account-billing/manage-app-passwords-for-two-step-verification-d6dc8c6d-4bf7-4851-ad95-6d07799387e9) "
+        "instead of your regular password."
     )
 
     outlook_email = st.text_input(
-        "Outlook email (inbox to monitor)",
+        "Outlook email",
         value=st.session_state.get("outlook_email", ""),
         placeholder="cadre.quote@distributor-systems.com",
     )
@@ -88,45 +124,38 @@ def render():
     )
     poll_interval = st.slider(
         "Poll interval (seconds)",
-        min_value=30,
-        max_value=600,
+        min_value=30, max_value=600,
         value=st.session_state.get("poll_interval", 60),
         step=30,
-        help="How often the agent checks for new emails",
     )
 
-    if st.button("Test Outlook connection"):
+    if st.button("🔌 Test Outlook connection", key="test_outlook"):
         if not outlook_email or not outlook_password:
-            st.error("Enter email and password.")
+            st.error("Enter email and password first.")
         else:
-            try:
-                from exchangelib import Credentials, Account, DELEGATE, Configuration
-                credentials = Credentials(outlook_email, outlook_password)
-                config = Configuration(server="outlook.office365.com", credentials=credentials)
-                account = Account(
-                    primary_smtp_address=outlook_email,
-                    config=config,
-                    autodiscover=False,
-                    access_type=DELEGATE,
-                )
-                count = account.inbox.total_count
-                st.success(f"✅ Connected! Inbox has {count} total messages.")
-            except Exception as e:
-                st.error(f"❌ Connection failed: {e}")
+            with st.spinner("Connecting…"):
+                try:
+                    from exchangelib import Credentials, Account, DELEGATE, Configuration
+                    creds   = Credentials(outlook_email, outlook_password)
+                    config  = Configuration(server="outlook.office365.com", credentials=creds)
+                    account = Account(primary_smtp_address=outlook_email, config=config,
+                                      autodiscover=False, access_type=DELEGATE)
+                    st.success(f"✅ Connected! Inbox has {account.inbox.total_count} messages.")
+                except Exception as e:
+                    st.error(f"❌ Failed: {e}")
 
     st.markdown("---")
 
-    # ── Output settings ────────────────────────────────────────────────────────
+    # ── Output ────────────────────────────────────────────────────────────────
     st.subheader("📁 Output")
     output_xlsx = st.text_input(
         "Excel output path",
-        value=st.session_state.get("output_xlsx", XLSX_PATH),
-        help="Relative or absolute path for the output .xlsx file",
+        value=st.session_state.get("output_xlsx", "data/cadre_quotes.xlsx"),
     )
 
     st.markdown("---")
 
-    # ── Save ──────────────────────────────────────────────────────────────────
+    # ── Save button ───────────────────────────────────────────────────────────
     if st.button("💾 Save settings", type="primary"):
         st.session_state["groq_api_key"]     = api_key
         st.session_state["groq_model"]       = model
@@ -134,21 +163,21 @@ def render():
         st.session_state["outlook_password"] = outlook_password
         st.session_state["poll_interval"]    = poll_interval
         st.session_state["output_xlsx"]      = output_xlsx
-        st.success("✅ Settings saved for this session.")
-        st.info("💡 To persist settings across restarts, add them to `.streamlit/secrets.toml` or as environment variables.")
+        st.success("✅ Settings saved! Switch to **Upload Quotes** to process files.")
 
     # ── secrets.toml helper ───────────────────────────────────────────────────
-    with st.expander("📋 secrets.toml template (copy to .streamlit/secrets.toml)"):
-        st.code(f"""
-[groq]
-api_key = "{api_key or 'gsk_...'}"
+    st.markdown("---")
+    with st.expander("📋 Persist settings — copy to `.streamlit/secrets.toml`"):
+        st.info("Add this file to your repo (it's gitignored) or paste into Streamlit Cloud → Settings → Secrets.")
+        st.code(f"""[groq]
+api_key = "{api_key or 'gsk_your_key_here'}"
 model   = "{model}"
 
 [outlook]
 email    = "{outlook_email or 'cadre.quote@distributor-systems.com'}"
-password = "your-app-password"
+password = "your-app-password-here"
 
 [output]
-xlsx_path = "{output_xlsx}"
+xlsx_path     = "{output_xlsx}"
 poll_interval = {poll_interval}
 """, language="toml")
