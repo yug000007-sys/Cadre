@@ -1,6 +1,6 @@
 """
 Cadre Wire Group — Quote Parser
-Mirrors Sheffer pattern: extract-msg + pymupdf + Groq AI
+Uses extract-msg + pymupdf + Groq AI
 """
 
 import re
@@ -9,7 +9,6 @@ import json
 import tempfile
 import shutil
 import gc
-from datetime import datetime
 
 import fitz
 
@@ -30,7 +29,6 @@ except Exception:
         return os.environ.get("GROQ_API_KEY", "")
 
 
-# ── Salesperson email map ─────────────────────────────────────────────────────
 SALESPERSON_MAP = {
     "regina deavers":   "rdeavers@cadrewire.com",
     "dara august":      "daugust@cadrewire.com",
@@ -38,36 +36,14 @@ SALESPERSON_MAP = {
     "industrial sales": "rdeavers@cadrewire.com",
 }
 
-# ── Column headers (exact match to SampleCadre.xlsx) ─────────────────────────
 HEADERS = [
-    "ReferralManager",
-    "ReferralEmail",
-    "Brand",
-    "QuoteNumber",
-    "QuoteDate",
-    "Company",
-    "FirstName",
-    "LastName",
-    "ContactEmail",
-    "ContactPhone",
-    "Address",
-    "County",
-    "City",
-    "State",
-    "ZipCode",
-    "Country",
-    "item_id",
-    "item_desc",
-    "Unit Price",
-    "TotalSales",
-    "QuoteValidDate",
-    "CustomerNumber",
-    "manufacturer_Name",
-    "PDF",
-    "DemoQuote",
+    "ReferralManager", "ReferralEmail", "Brand", "QuoteNumber", "QuoteDate",
+    "Company", "FirstName", "LastName", "ContactEmail", "ContactPhone",
+    "Address", "County", "City", "State", "ZipCode", "Country",
+    "item_id", "item_desc", "Unit Price", "TotalSales",
+    "QuoteValidDate", "CustomerNumber", "manufacturer_Name", "PDF", "DemoQuote",
 ]
 
-# ── Groq extraction prompt ────────────────────────────────────────────────────
 PROMPT = """You are a data extraction agent for Cadre Wire Group.
 Extract ALL fields from this sales quote PDF text. Return ONLY valid JSON, no markdown.
 
@@ -123,6 +99,16 @@ def _pdf_to_text(pdf_bytes):
     return "\n".join(page.get_text("text") for page in doc)
 
 
+def _is_quote_pdf(filename):
+    """
+    Returns True only for the main Cadre quote PDF.
+    Pattern: 'Quote 123562.pdf' or 'Quote123562.pdf'
+    Excludes spec sheets like HSIC440FR.pdf, HW.06320-PWR.pdf etc.
+    """
+    name = _clean(filename).lower()
+    return bool(re.match(r"quote\s*\d+", name))
+
+
 def _make_pdf_name(quote_number):
     safe = _clean(quote_number)
     return f"Cadre Wire Group_{safe}.pdf" if safe else "Cadre Wire Group_unknown.pdf"
@@ -146,13 +132,11 @@ def _extract_with_groq(pdf_text):
     return json.loads(raw)
 
 
-def _build_rows(data, pdf_name, received_datetime=""):
+def _build_rows(data, pdf_name):
     salesperson = _clean(data.get("salesperson", ""))
-    referral_email = _referral_email(salesperson)
-
     base = {
         "ReferralManager":   "",
-        "ReferralEmail":     referral_email,
+        "ReferralEmail":     _referral_email(salesperson),
         "Brand":             "Cadre Wire Group",
         "QuoteNumber":       _clean(data.get("quote_number", "")),
         "QuoteDate":         _clean(data.get("quote_date", "")),
@@ -173,7 +157,6 @@ def _build_rows(data, pdf_name, received_datetime=""):
         "PDF":               pdf_name,
         "DemoQuote":         "",
     }
-
     rows = []
     for item in data.get("line_items", []):
         row = {
@@ -184,37 +167,34 @@ def _build_rows(data, pdf_name, received_datetime=""):
             "TotalSales": item.get("extension", ""),
         }
         rows.append({h: row.get(h, "") for h in HEADERS})
-
     return rows
 
 
-def _process_pdf_bytes(pdf_bytes, received_datetime=""):
+def _process_quote_pdf(pdf_bytes):
+    """Send only the main quote PDF to Groq. Fast — one API call per quote."""
     text = _pdf_to_text(pdf_bytes)
     if not text.strip():
-        raise ValueError("No text could be extracted from this PDF (may be a scanned image)")
-
+        raise ValueError("No text could be extracted (scanned image?)")
     data = _extract_with_groq(text)
     q_num = _clean(data.get("quote_number", "unknown"))
     pdf_name = _make_pdf_name(q_num)
-    rows = _build_rows(data, pdf_name, received_datetime)
-
+    rows = _build_rows(data, pdf_name)
     if not rows:
         raise ValueError(f"No line items found in quote {q_num}")
-
     return rows, pdf_name
 
 
-# ── Public entry points (same interface as sheffer_d.py) ─────────────────────
+# ── Public entry points ───────────────────────────────────────────────────────
 
 def process_pdf_file(uploaded_file):
     pdf_bytes = uploaded_file.read()
-    rows, pdf_name = _process_pdf_bytes(pdf_bytes)
+    rows, pdf_name = _process_quote_pdf(pdf_bytes)
     return {"rows": rows, "pdfs": [(pdf_name, pdf_bytes)]}
 
 
 def process_msg_file(uploaded_file):
     if extract_msg is None:
-        raise RuntimeError("extract-msg is not installed — add it to requirements.txt")
+        raise RuntimeError("extract-msg is not installed")
 
     temp_dir = tempfile.mkdtemp()
     tmp_path = os.path.join(temp_dir, "input.msg")
@@ -226,27 +206,27 @@ def process_msg_file(uploaded_file):
 
         msg = extract_msg.Message(tmp_path)
 
-        # Get received date from MSG
-        received_datetime = ""
-        try:
-            if msg.date:
-                received_datetime = str(msg.date)
-        except Exception:
-            pass
-
         rows = []
         pdfs = []
 
         for att in msg.attachments:
             filename = att.longFilename or att.shortFilename or ""
-            if filename.lower().endswith(".pdf"):
-                pdf_bytes = att.data
-                pdf_rows, pdf_name = _process_pdf_bytes(pdf_bytes, received_datetime)
+            if not filename.lower().endswith(".pdf"):
+                continue
+
+            pdf_bytes = att.data
+
+            if _is_quote_pdf(filename):
+                # Main quote PDF → send to Groq
+                pdf_rows, pdf_name = _process_quote_pdf(pdf_bytes)
                 rows.extend(pdf_rows)
                 pdfs.append((pdf_name, pdf_bytes))
+            else:
+                # Spec sheet / extra attachment → save as-is, skip Groq
+                pdfs.append((filename, pdf_bytes))
 
         if not rows:
-            raise ValueError("No PDF attachments found in this MSG file")
+            raise ValueError("No main quote PDF found in this MSG (expected 'Quote XXXXXX.pdf')")
 
         return {"rows": rows, "pdfs": pdfs}
 
