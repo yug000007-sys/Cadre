@@ -1,32 +1,32 @@
 """
 Cadre Wire Group — Quote Parser
-Uses extract-msg + pymupdf + Groq AI
+Pure regex + pdfminer/pymupdf. No AI/API required.
 """
 
 import re
 import os
-import json
 import tempfile
 import shutil
 import gc
 
-import fitz
+try:
+    import fitz
+    def _pdf_to_text(pdf_bytes):
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        return "\n".join(page.get_text("text") for page in doc)
+except ImportError:
+    from pdfminer.high_level import extract_text_to_fp
+    from pdfminer.layout import LAParams
+    from io import BytesIO
+    def _pdf_to_text(pdf_bytes):
+        out = BytesIO()
+        extract_text_to_fp(BytesIO(pdf_bytes), out, laparams=LAParams(), output_type="text")
+        return out.getvalue().decode("utf-8", errors="ignore")
 
 try:
     import extract_msg
 except Exception:
     extract_msg = None
-
-try:
-    import streamlit as st
-    def _get_groq_key():
-        try:
-            return st.secrets["groq"]["api_key"]
-        except Exception:
-            return os.environ.get("GROQ_API_KEY", "")
-except Exception:
-    def _get_groq_key():
-        return os.environ.get("GROQ_API_KEY", "")
 
 
 SALESPERSON_MAP = {
@@ -44,143 +44,202 @@ HEADERS = [
     "QuoteValidDate", "CustomerNumber", "manufacturer_Name", "PDF", "DemoQuote",
 ]
 
-PROMPT = """You are a data extraction agent for Cadre Wire Group.
-Extract ALL fields from this sales quote PDF text. Return ONLY valid JSON, no markdown.
 
-Return exactly this structure:
-{
-  "quote_number":        "string",
-  "quote_date":          "MM/DD/YYYY",
-  "quote_valid_through": "MM/DD/YYYY",
-  "customer_number":     "string",
-  "company":             "string",
-  "contact_first_name":  "string",
-  "contact_last_name":   "string",
-  "contact_email":       "string or empty",
-  "contact_phone":       "string or empty",
-  "address":             "string",
-  "city":                "string",
-  "state":               "string",
-  "zip_code":            "string",
-  "country":             "string",
-  "salesperson":         "string",
-  "line_items": [
-    {
-      "item_id":    "string",
-      "item_desc":  "string",
-      "ordered":    number,
-      "unit_price": number,
-      "extension":  number
-    }
-  ],
-  "product_total": number,
-  "tax":           number,
-  "grand_total":   number
-}
-
-Rules:
-- Include Tax as a line item: item_id="Tax", item_desc="", ordered=1, unit_price=tax_amount, extension=tax_amount
-- For cable priced per MFT keep unit_price as the MFT rate (e.g. 4190.0)
-- country default is "USA"
-- Return ONLY raw JSON, no fences
-
-PDF TEXT:
-"""
-
-
-def _clean(value):
-    if value is None:
+def _clean(v):
+    if v is None:
         return ""
-    return re.sub(r"\s+", " ", str(value).replace("\xa0", " ")).strip()
-
-
-def _pdf_to_text(pdf_bytes):
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    return "\n".join(page.get_text("text") for page in doc)
-
-
-def _is_quote_pdf(filename):
-    """
-    Returns True only for the main Cadre quote PDF.
-    Pattern: 'Quote 123562.pdf' or 'Quote123562.pdf'
-    Excludes spec sheets like HSIC440FR.pdf, HW.06320-PWR.pdf etc.
-    """
-    name = _clean(filename).lower()
-    return bool(re.match(r"quote\s*\d+", name))
-
-
-def _make_pdf_name(quote_number):
-    safe = _clean(quote_number)
-    return f"Cadre Wire Group_{safe}.pdf" if safe else "Cadre Wire Group_unknown.pdf"
+    return re.sub(r"\s+", " ", str(v).replace("\xa0", " ")).strip()
 
 
 def _referral_email(salesperson):
     return SALESPERSON_MAP.get(_clean(salesperson).lower(), "rdeavers@cadrewire.com")
 
 
-def _extract_with_groq(pdf_text):
-    from groq import Groq
-    client = Groq(api_key=_get_groq_key())
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": PROMPT + pdf_text}],
-        temperature=0.0,
-        max_tokens=4096,
+def _make_pdf_name(quote_number):
+    s = _clean(quote_number)
+    return f"Cadre Wire Group_{s}.pdf" if s else "Cadre Wire Group_unknown.pdf"
+
+
+def _is_quote_pdf(filename):
+    return bool(re.match(r"quote\s*\d+", filename.lower().strip()))
+
+
+# ── Header parsing ────────────────────────────────────────────────────────────
+
+def _parse_header(text):
+    lines = [_clean(l) for l in text.splitlines() if _clean(l)]
+
+    data = {
+        "quote_number": "", "customer_number": "", "contact": "",
+        "salesperson": "", "quote_date": "", "quote_valid": "",
+        "company": "", "address": "", "city": "", "state": "",
+        "zip_code": "", "country": "USA",
+    }
+
+    # Quote number — first standalone 6-digit number
+    for line in lines[:25]:
+        if re.fullmatch(r"\d{6}", line):
+            data["quote_number"] = line
+            break
+
+    # Customer number — next standalone 5-7 digit number after quote number
+    found = False
+    for line in lines[:25]:
+        if line == data["quote_number"]:
+            found = True
+            continue
+        if found and re.fullmatch(r"\d{5,7}", line):
+            data["customer_number"] = line
+            break
+
+    # Contact + Salesperson — two lines after customer number
+    for i, line in enumerate(lines[:25]):
+        if line == data["customer_number"] and data["customer_number"]:
+            if i + 1 < len(lines): data["contact"]     = lines[i + 1]
+            if i + 2 < len(lines): data["salesperson"] = lines[i + 2]
+            break
+
+    # Quote date
+    for line in lines[:35]:
+        if re.fullmatch(r"\d{1,2}/\d{1,2}/\d{4}", line):
+            data["quote_date"] = line
+            break
+
+    # Quote valid through
+    m = re.search(r"Quote Good Through\s*\n+\s*(\d{1,2}/\d{1,2}/\d{4})", text)
+    if not m:
+        m = re.search(r"Quote Good Through\s+(\d{1,2}/\d{1,2}/\d{4})", text)
+    if m:
+        data["quote_valid"] = m.group(1)
+
+    # Company + address from "Quoted For:" block
+    m2 = re.search(r"Quoted For:\n+(.+?)\n+(.+?)\n+(.+?)(?:\n|$)", text)
+    if m2:
+        data["company"] = _clean(m2.group(1))
+        data["address"] = _clean(m2.group(2))
+        _parse_city_line(_clean(m2.group(3)), data)
+
+    return data
+
+
+def _parse_city_line(line, data):
+    if line in ("United States of America", "United States"):
+        data["country"] = "USA"
+        return
+    # "Houston, TX 77040" or "Little Rock, AR 72209"
+    m = re.match(r"^(.+?),?\s+([A-Z]{2})\s+(\d{5}(?:-\d{4})?)\s*$", line)
+    if m:
+        data["city"]     = m.group(1).strip()
+        data["state"]    = m.group(2)
+        data["zip_code"] = m.group(3)
+        data["country"]  = "USA"
+        return
+    # Canada
+    m2 = re.match(r"^(.+?)\s+([A-Z]{2})\s+CANADA\s+([A-Z]\d[A-Z]\s?\d[A-Z]\d)$", line, re.I)
+    if m2:
+        data["city"]     = m2.group(1).strip()
+        data["state"]    = m2.group(2)
+        data["zip_code"] = m2.group(3)
+        data["country"]  = "CANADA"
+
+
+# ── Line item parsing ─────────────────────────────────────────────────────────
+
+def _parse_line_items(text):
+    # Items: line# \n\n item_id \n description (double newlines between number and id)
+    item_matches = list(re.finditer(
+        r"(?<!\d)(\d{1,3})\n\n([A-Z][A-Z0-9./_\-]{2,})\n(.*?)(?=\n\n?\d{1,3}\n\n?[A-Z][A-Z0-9./_\-]{2,}\n|\nOrdered\n|\nProduct\n|\nPage\n|\Z)",
+        text, re.DOTALL
+    ))
+
+    # Qty/price/extension triplets: "4 FT\n\n0.80000\n\nFT\n\n3.20"
+    qty_matches = re.findall(
+        r"(\d[\d,]*)\s+(FT|EAC|MFT|LOT|EA|PR)\s+([\d,]+\.\d+)\s+(?:FT|EAC|MFT|LOT|EA|PR)\s+([\d,]+\.\d{2})",
+        text
     )
-    raw = response.choices[0].message.content.strip()
-    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
-    return json.loads(raw)
+
+    # Tax — pattern: "Product\nTax\n\nTotal\n\n{product}\n{tax}\n{grand}"
+    tax_amount = 0.0
+    m_tax = re.search(r"Product\nTax\n+Total\n+([\d,]+\.\d{2})\n+([\d,]+\.\d{2})", text)
+    if m_tax:
+        tax_amount = float(m_tax.group(2).replace(",", ""))
+
+    rows = []
+    for i, m in enumerate(item_matches):
+        item_id   = _clean(m.group(2))
+        item_desc = _clean(re.sub(r"\s+", " ", m.group(3)))
+
+        if i < len(qty_matches):
+            _, _, price_raw, ext_raw = qty_matches[i]
+            price = float(price_raw.replace(",", ""))
+            ext   = float(ext_raw.replace(",", ""))
+        else:
+            price, ext = 0.0, 0.0
+
+        rows.append({
+            "item_id":    item_id,
+            "item_desc":  item_desc,
+            "Unit Price": price,
+            "TotalSales": ext,
+        })
+
+    if tax_amount > 0:
+        rows.append({
+            "item_id":    "Tax",
+            "item_desc":  "",
+            "Unit Price": tax_amount,
+            "TotalSales": tax_amount,
+        })
+
+    return rows
 
 
-def _build_rows(data, pdf_name):
-    salesperson = _clean(data.get("salesperson", ""))
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def _parse_quote_pdf(pdf_bytes):
+    text       = _pdf_to_text(pdf_bytes)
+    header     = _parse_header(text)
+    line_items = _parse_line_items(text)
+
+    if not line_items:
+        raise ValueError(f"No line items found in quote {header.get('quote_number', '?')}")
+
+    q_num    = header["quote_number"]
+    pdf_name = _make_pdf_name(q_num)
+
+    parts = header["contact"].split()
+    first = parts[0] if parts else ""
+    last  = " ".join(parts[1:]) if len(parts) > 1 else ""
+
     base = {
         "ReferralManager":   "",
-        "ReferralEmail":     _referral_email(salesperson),
+        "ReferralEmail":     _referral_email(header["salesperson"]),
         "Brand":             "Cadre Wire Group",
-        "QuoteNumber":       _clean(data.get("quote_number", "")),
-        "QuoteDate":         _clean(data.get("quote_date", "")),
-        "Company":           _clean(data.get("company", "")),
-        "FirstName":         _clean(data.get("contact_first_name", "")),
-        "LastName":          _clean(data.get("contact_last_name", "")),
-        "ContactEmail":      _clean(data.get("contact_email", "")),
-        "ContactPhone":      _clean(data.get("contact_phone", "")),
-        "Address":           _clean(data.get("address", "")),
+        "QuoteNumber":       q_num,
+        "QuoteDate":         header["quote_date"],
+        "Company":           header["company"],
+        "FirstName":         first,
+        "LastName":          last,
+        "ContactEmail":      "",
+        "ContactPhone":      "",
+        "Address":           header["address"],
         "County":            "",
-        "City":              _clean(data.get("city", "")),
-        "State":             _clean(data.get("state", "")),
-        "ZipCode":           _clean(data.get("zip_code", "")),
-        "Country":           _clean(data.get("country", "USA")),
-        "QuoteValidDate":    _clean(data.get("quote_valid_through", "")),
-        "CustomerNumber":    _clean(data.get("customer_number", "")),
+        "City":              header["city"],
+        "State":             header["state"],
+        "ZipCode":           header["zip_code"],
+        "Country":           header["country"],
+        "QuoteValidDate":    header["quote_valid"],
+        "CustomerNumber":    header["customer_number"],
         "manufacturer_Name": "",
         "PDF":               pdf_name,
         "DemoQuote":         "",
     }
+
     rows = []
-    for item in data.get("line_items", []):
-        row = {
-            **base,
-            "item_id":    _clean(item.get("item_id", "")),
-            "item_desc":  _clean(item.get("item_desc", "")),
-            "Unit Price": item.get("unit_price", ""),
-            "TotalSales": item.get("extension", ""),
-        }
+    for item in line_items:
+        row = {**base, **item}
         rows.append({h: row.get(h, "") for h in HEADERS})
-    return rows
 
-
-def _process_quote_pdf(pdf_bytes):
-    """Send only the main quote PDF to Groq. Fast — one API call per quote."""
-    text = _pdf_to_text(pdf_bytes)
-    if not text.strip():
-        raise ValueError("No text could be extracted (scanned image?)")
-    data = _extract_with_groq(text)
-    q_num = _clean(data.get("quote_number", "unknown"))
-    pdf_name = _make_pdf_name(q_num)
-    rows = _build_rows(data, pdf_name)
-    if not rows:
-        raise ValueError(f"No line items found in quote {q_num}")
     return rows, pdf_name
 
 
@@ -188,7 +247,7 @@ def _process_quote_pdf(pdf_bytes):
 
 def process_pdf_file(uploaded_file):
     pdf_bytes = uploaded_file.read()
-    rows, pdf_name = _process_quote_pdf(pdf_bytes)
+    rows, pdf_name = _parse_quote_pdf(pdf_bytes)
     return {"rows": rows, "pdfs": [(pdf_name, pdf_bytes)]}
 
 
@@ -205,35 +264,28 @@ def process_msg_file(uploaded_file):
             f.write(uploaded_file.read())
 
         msg = extract_msg.Message(tmp_path)
-
-        rows = []
-        pdfs = []
+        rows, pdfs = [], []
 
         for att in msg.attachments:
             filename = att.longFilename or att.shortFilename or ""
             if not filename.lower().endswith(".pdf"):
                 continue
-
             pdf_bytes = att.data
-
             if _is_quote_pdf(filename):
-                # Main quote PDF → send to Groq
-                pdf_rows, pdf_name = _process_quote_pdf(pdf_bytes)
+                pdf_rows, pdf_name = _parse_quote_pdf(pdf_bytes)
                 rows.extend(pdf_rows)
                 pdfs.append((pdf_name, pdf_bytes))
             else:
-                # Spec sheet / extra attachment → save as-is, skip Groq
                 pdfs.append((filename, pdf_bytes))
 
         if not rows:
-            raise ValueError("No main quote PDF found in this MSG (expected 'Quote XXXXXX.pdf')")
+            raise ValueError("No main quote PDF found (expected 'Quote XXXXXX.pdf')")
 
         return {"rows": rows, "pdfs": pdfs}
 
     finally:
         try:
-            if msg is not None:
-                msg.close()
+            if msg: msg.close()
         except Exception:
             pass
         try:

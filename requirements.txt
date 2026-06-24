@@ -3,5 +3,4 @@ pandas
 openpyxl
 pymupdf
 extract-msg
-groq
 python-dateutil
