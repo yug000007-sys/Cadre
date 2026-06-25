@@ -4,3 +4,4 @@ openpyxl
 pymupdf
 extract-msg
 python-dateutil
+groq
