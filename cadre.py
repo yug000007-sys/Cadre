@@ -1,6 +1,13 @@
 """
-Cadre Wire Group — Quote Parser
-Uses extract-msg + pymupdf + Groq AI (llama-3.1-8b-instant)
+Cadre Wire Group - Quote Parser
+Uses extract-msg + pymupdf/pdfminer + local Ollama AI
+
+Ollama setup:
+  1. Install and start Ollama: https://ollama.com
+  2. Pull a model, for example: ollama pull llama3.1:8b
+  3. Optional environment variables:
+     OLLAMA_MODEL=llama3.1:8b
+     OLLAMA_BASE_URL=http://localhost:11434
 """
 
 import re
@@ -29,16 +36,9 @@ try:
 except Exception:
     extract_msg = None
 
-try:
-    import streamlit as st
-    def _get_groq_key():
-        try:
-            return st.secrets["groq"]["api_key"]
-        except Exception:
-            return os.environ.get("GROQ_API_KEY", "")
-except Exception:
-    def _get_groq_key():
-        return os.environ.get("GROQ_API_KEY", "")
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gemma4:31b-cloud")
+OLLAMA_TIMEOUT_SECONDS = int(os.environ.get("OLLAMA_TIMEOUT_SECONDS", "120"))
 
 
 SALESPERSON_MAP = {
@@ -124,7 +124,6 @@ def _trim_pdf_text(text, max_chars=3500):
     Remove boilerplate footer text to stay within model token limits.
     Keeps everything up to and including the last line item / tax row.
     """
-    # Cut at Terms & Conditions or page footers — pure boilerplate after that
     for marker in ["Terms and Conditions", "Terms & Conditions",
                    "TERMS AND CONDITIONS", "Thank you for",
                    "This quote is valid"]:
@@ -132,29 +131,116 @@ def _trim_pdf_text(text, max_chars=3500):
         if idx > 0:
             text = text[:idx]
             break
-    # Hard cap at max_chars
     if len(text) > max_chars:
         text = text[:max_chars]
     return text.strip()
 
 
-def _extract_with_groq(pdf_text):
-    from groq import Groq
-    pdf_text = _trim_pdf_text(pdf_text)
-    client = Groq(api_key=_get_groq_key())
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": PROMPT + pdf_text}],
-        temperature=0.0,
-        max_tokens=4096,
-    )
-    raw = response.choices[0].message.content.strip()
+def _extract_json_object(raw):
+    """Return the first valid JSON object from an LLM response."""
+    raw = raw.strip()
     raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
-    return json.loads(raw)
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError(f"Ollama did not return JSON. Response starts with: {raw[:300]!r}")
+
+    return json.loads(raw[start:end + 1])
 
 
-def _build_rows(data, pdf_name):
+def _extract_with_ollama(pdf_text):
+    """Extract quote fields using a locally running Ollama model."""
+    from urllib import request, error
+
+    pdf_text = _trim_pdf_text(pdf_text)
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": [{"role": "user", "content": PROMPT + pdf_text}],
+        "stream": False,
+        "format": "json",
+        "options": {
+            "temperature": 0,
+            "num_predict": 4096,
+        },
+    }
+
+    req = request.Request(
+        f"{OLLAMA_BASE_URL}/api/chat",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    print(f"{OLLAMA_BASE_URL}/api/chat")
+
+    try:
+        with request.urlopen(req, timeout=OLLAMA_TIMEOUT_SECONDS) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+    except error.URLError as exc:
+        raise RuntimeError(
+            "Could not connect to Ollama. Make sure Ollama is running and the "
+            "model is pulled, e.g. `ollama pull llama3.1:8b`."
+        ) from exc
+
+    raw = result.get("message", {}).get("content", "")
+    if not raw:
+        raise ValueError(f"Ollama returned an empty response: {result}")
+    return _extract_json_object(raw)
+
+
+def _extract_prices_from_text(pdf_text):
+    """
+    Extract {item_id: (unit_price, extension)} directly from PDF text using regex.
+    Handles fitz EAC (same-line), fitz MFT (cross-line), and pdfminer formats.
+    """
+    U = r"(?:FT|EAC|MFT|LOT|EA|PR|C)"
+
+    # Pattern 1: fitz EAC — item_id + qty + price + ext on same line
+    p1 = re.findall(
+        r"(?:^|\n)\d{1,3}\s+([A-Z][A-Z0-9./_\-]{3,})\s+[\d,]+\s+(?:FT|EAC|MFT|LOT|EA|PR|C)\s+([\d,]+\.\d+)\s+(?:FT|EAC|MFT|LOT|EA|PR|C)\s+([\d,]+\.\d{2})",
+        pdf_text
+    )
+    if p1:
+        return {iid: (float(p.replace(",","")), float(e.replace(",",""))) for iid, p, e in p1}
+
+    # Pattern 2: fitz MFT — "qty UNIT\nprice UNIT\next"
+    item_ids_fitz = re.findall(r"(?:^|\n)\d{1,3}\s+([A-Z][A-Z0-9./_\-]{3,})", pdf_text)
+    triplets_fitz = re.findall(
+        r"[\d,]+\s+(?:FT|EAC|MFT|LOT|EA|PR|C)\n+([\d,]+\.\d+)\s+(?:FT|EAC|MFT|LOT|EA|PR|C)\n+([\d,]+\.\d{2})",
+        pdf_text
+    )
+    if item_ids_fitz and triplets_fitz and len(triplets_fitz) >= len(item_ids_fitz):
+        prices = {}
+        for i, iid in enumerate(item_ids_fitz):
+            p, e = triplets_fitz[i]
+            prices[iid] = (float(p.replace(",","")), float(e.replace(",","")))
+        return prices
+
+    # Pattern 3: pdfminer — item_ids and prices in interleaved column blocks
+    item_ids_pm = [iid for _, iid in re.findall(r"\n\n(\d{1,3})\n\n([A-Z][A-Z0-9./_\-]{3,})\n", pdf_text)]
+    triplets_pm = re.findall(
+        r"[\d,]+\s+(?:FT|EAC|MFT|LOT|EA|PR|C)\n\n([\d,]+\.\d+)\n\n(?:FT|EAC|MFT|LOT|EA|PR|C)\n\n([\d,]+\.\d{2})",
+        pdf_text
+    )
+    prices = {}
+    for i, iid in enumerate(item_ids_pm):
+        if i < len(triplets_pm):
+            p, e = triplets_pm[i]
+            prices[iid] = (float(p.replace(",","")), float(e.replace(",","")))
+    return prices
+
+
+def _build_rows(data, pdf_name, pdf_text=""):
     salesperson = _clean(data.get("salesperson", ""))
+
+    # Extract prices from PDF text as ground truth (overrides AI values)
+    price_map = _extract_prices_from_text(pdf_text) if pdf_text else {}
+
     base = {
         "ReferralManager":   "",
         "ReferralEmail":     _referral_email(salesperson),
@@ -180,12 +266,21 @@ def _build_rows(data, pdf_name):
     }
     rows = []
     for item in data.get("line_items", []):
+        item_id = _clean(item.get("item_id", ""))
+
+        if item_id in price_map:
+            unit_price  = price_map[item_id][0]
+            total_sales = price_map[item_id][1]
+        else:
+            unit_price  = item.get("unit_price", "")
+            total_sales = item.get("extension", "")
+
         row = {
             **base,
-            "item_id":    _clean(item.get("item_id", "")),
+            "item_id":    item_id,
             "item_desc":  _clean(item.get("item_desc", "")),
-            "Unit Price": item.get("unit_price", ""),
-            "TotalSales": item.get("extension", ""),
+            "Unit Price": unit_price,
+            "TotalSales": total_sales,
         }
         rows.append({h: row.get(h, "") for h in HEADERS})
     return rows
@@ -195,10 +290,10 @@ def _parse_quote_pdf(pdf_bytes):
     text = _pdf_to_text(pdf_bytes)
     if not text.strip():
         raise ValueError("No text could be extracted from this PDF")
-    data     = _extract_with_groq(text)
+    data     = _extract_with_ollama(text)
     q_num    = _clean(data.get("quote_number", "unknown"))
     pdf_name = _make_pdf_name(q_num)
-    rows     = _build_rows(data, pdf_name)
+    rows     = _build_rows(data, pdf_name, pdf_text=text)
     if not rows:
         raise ValueError(f"No line items found in quote {q_num}")
     return rows, pdf_name
