@@ -119,11 +119,31 @@ def _is_quote_pdf(filename):
     return bool(re.match(r"quote\s*\d+", filename.lower().strip()))
 
 
+def _trim_pdf_text(text, max_chars=3500):
+    """
+    Remove boilerplate footer text to stay within model token limits.
+    Keeps everything up to and including the last line item / tax row.
+    """
+    # Cut at Terms & Conditions or page footers — pure boilerplate after that
+    for marker in ["Terms and Conditions", "Terms & Conditions",
+                   "TERMS AND CONDITIONS", "Thank you for",
+                   "This quote is valid"]:
+        idx = text.find(marker)
+        if idx > 0:
+            text = text[:idx]
+            break
+    # Hard cap at max_chars
+    if len(text) > max_chars:
+        text = text[:max_chars]
+    return text.strip()
+
+
 def _extract_with_groq(pdf_text):
     from groq import Groq
+    pdf_text = _trim_pdf_text(pdf_text)
     client = Groq(api_key=_get_groq_key())
     response = client.chat.completions.create(
-        model="llama-3.1-8b-instant",   # 500k tokens/day free — separate limit from 70b
+        model="llama-3.3-70b-versatile",
         messages=[{"role": "user", "content": PROMPT + pdf_text}],
         temperature=0.0,
         max_tokens=4096,
